@@ -1,0 +1,88 @@
+#Image: The docker image to use
+image: maven:3-jdk-8
+
+variables:
+#Set variable for maven repo
+#Place maven repo in cache. Don't download m2 repo for each build. Disabled since we use artifactory local
+ # MAVEN_COMMAND: mvn -Dmaven.repo.local=/cache/maven.repository
+ #Run the tests quietly
+  MAVEN_COMMAND: mvn -q -Droot-level-logging=ERROR -Dspring.main.show_banner=false
+  MVN_SONAR_COMMAND: $MAVEN_COMMAND --batch-mode -Psonar sonar:sonar
+                       -Dsonar.login=$SONAR_LOGIN
+                       -Dsonar.password=$SONAR_PASSWORD
+                       -Dsonar.host.url=https://somewhere.sonarqube.com
+                       -Dsonar.projectKey=$CI_PROJECT_NAMESPACE-$CI_PROJECT_NAME
+                       -Dsonar.projectName=$CI_PROJECT_NAMESPACE-$CI_PROJECT_NAME
+                       -Dsonar.issuesReport.console.enable=true
+                       -Dsonar.issuesReport.html.enable=true
+                       -Dsonar.junit.reportsPath=target/surefire-reports
+                       -Dsonar.cobertura.reportPath=target/site/cobertura/coverage.xml
+                       -Dsonar.gitlab.commit_sha=$CI_BUILD_REF
+                       -Dsonar.gitlab.ref_name=$CI_BUILD_REF_NAME
+                       -Dsonar.gitlab.project_id=$CI_PROJECT_ID
+  COBERTURA_CONSOLE_OUPUT_FILE: cobertura-build-console.output
+
+#Stages: Define build stages 
+stages:
+   - build
+   - test
+   - deploy
+
+#The build job 
+build:
+   stage: build
+   script:
+     #Generate Cobertura report. Cobertura will not fail the build when tests fail.
+     #Thats why we send the console output to a separate file that we can then use to determine if there were test failures
+     - $MAVEN_COMMAND cobertura:cobertura -Dcobertura.report.format=xml | tee $COBERTURA_CONSOLE_OUPUT_FILE
+     #print the code coverage stored in the generated cobertura report
+     - echo -n "TotalTestCoverage["$(grep  -o "<coverage line-rate=\"[^\"]*" target/site/cobertura/coverage.xml |  tr -d '\.\"\=\-\<[:space:][:blank:][:alpha:]' | cut -c1-3 );echo  "%]"
+     #Running the mvn cobertura command the build does not fail if there are test failures.
+     #This is normal and how cobertura is intended to work.
+     #In order to let the build fail when there are test failures we need to parse the console build output.
+     #Depending on the output we let the build fail.
+     #Simply using exit $? does not work because gitlab performs an echo on each script.
+
+     - "if ! grep -q -o 'There are test failures.' $COBERTURA_CONSOLE_OUPUT_FILE; then echo 'No test failures. Let build succeed'; exit 0; else echo 'There were test failures in the build. Failing the build stage...'; exit 1; fi"
+
+#For the master branch, do a full Sonar analysis.
+#The results will be published to SONAR
+#Sonar must occur after cobertura
+full-sonar:
+  #If a job doesn't specify a stage, the job is assigned the test stage.
+   stage: test
+   script:
+     #- $MVN_SONAR_COMMAND
+     - echo "do full sonar build when sonar is configured properly"
+   only:
+      - master
+
+#For a feature branch, do a preview Sonar analysis.
+#The results will not be stored. Only added to gitlab and the project page
+#Sonar must occur after cobertura
+preview-sonar:
+  stage: test
+  script:
+     # - $MVN_SONAR_COMMAND -Dsonar.analysis.mode=preview
+     - echo "do sonar preview when sonar is configured properly"
+  artifacts:
+      paths:
+        - target/sonar/issues-report/issues-report-light.html
+        - target/sonar/issues-report/issues-report.html
+  except:
+      - master
+
+#Build web page for project
+pages:
+     stage: deploy
+     dependencies:
+       - full-sonar
+     script:
+       - $MAVEN_COMMAND site
+       - mv -f -v target/site public
+     artifacts:
+       paths:
+         - public
+       expire_in: 30 days
+     only:
+        - master
